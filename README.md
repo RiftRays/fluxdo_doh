@@ -116,6 +116,12 @@ cargo build --release --target aarch64-apple-ios
 # 指定 DOH 服务器
 ./target/release/doh_proxy_bin 8080 --doh https://dns.alidns.com/dns-query
 
+# 指定上游 HTTP 代理
+./target/release/doh_proxy_bin 8080 --upstream-host 127.0.0.1 --upstream-port 7890
+
+# 指定带认证的上游 HTTP 代理
+./target/release/doh_proxy_bin 8080 --upstream-host 121.123.21.32 --upstream-port 7980 --upstream-user vincent --upstream-pass 123123123
+
 # 优先使用 IPv6
 ./target/release/doh_proxy_bin 8080 --ipv6
 ```
@@ -126,6 +132,11 @@ cargo build --release --target aarch64-apple-ios
 |------|------|
 | `<port>` | 监听端口（0 = 自动分配） |
 | `--doh <url>` | DOH 服务器 URL |
+| `--upstream-protocol <protocol>` | 上游代理协议（当前支持 `http`） |
+| `--upstream-host <host>` | 上游代理地址 |
+| `--upstream-port <port>` | 上游代理端口 |
+| `--upstream-user <user>` | 上游代理用户名（可选） |
+| `--upstream-pass <pass>` | 上游代理密码（可选） |
 | `--ipv6` | 优先使用 IPv6 地址 |
 
 ### 支持的 DOH 服务器
@@ -252,6 +263,8 @@ void doh_proxy_init_logging();
 3. **TCP 隧道**：建立到目标服务器的 TCP 连接
 4. **双向转发**：在客户端和服务器之间转发数据
 5. **ECH（可选）**：如果服务器支持，加密 TLS 握手中的 SNI
+
+当配置了上游 HTTP 代理时，客户端仍只连接本地 `127.0.0.1:<port>`，由本地网关再通过上游代理建立外部连接；这对 Android WebView 等不擅长处理带认证远端代理的场景更稳定。
 
 ## 依赖
 

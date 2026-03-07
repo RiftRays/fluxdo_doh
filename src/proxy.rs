@@ -37,10 +37,18 @@ impl DohProxyServer {
     pub async fn new(config: ProxyConfig) -> Result<Self> {
         info!("Creating MITM DOH proxy with DOH server: {}", config.doh_server);
 
-        let dns_resolver = Arc::new(DnsResolver::new(&config.doh_server, config.prefer_ipv6).await?);
+        let dns_resolver = Arc::new(
+            DnsResolver::new(
+                &config.doh_server,
+                config.prefer_ipv6,
+                config.upstream_proxy.clone(),
+            )
+            .await?,
+        );
         let doh_tls_connector = Arc::new(DohTlsConnector::new(
             dns_resolver.clone(),
             Duration::from_secs(config.timeout_secs),
+            config.upstream_proxy.clone(),
         ));
         let cert_manager = Arc::new(CertManager::new()?);
         let (shutdown_tx, _) = broadcast::channel(1);

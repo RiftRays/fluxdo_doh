@@ -5,6 +5,8 @@
 
 use crate::dns::DnsResolver;
 use crate::error::{DohProxyError, Result};
+use crate::upstream::connect_http_tunnel;
+use crate::UpstreamProxyConfig;
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -21,6 +23,7 @@ pub struct DohTlsConnector {
     dns_resolver: Arc<DnsResolver>,
     root_store: RootCertStore,
     timeout: Duration,
+    upstream_proxy: Option<UpstreamProxyConfig>,
     crypto_provider: Arc<rustls::crypto::CryptoProvider>,
     host_ip_cache: Arc<Mutex<HashMap<String, CachedHostIp>>>,
 }
@@ -32,7 +35,11 @@ struct CachedHostIp {
 
 impl DohTlsConnector {
     /// Create a new ECH connector
-    pub fn new(dns_resolver: Arc<DnsResolver>, timeout: Duration) -> Self {
+    pub fn new(
+        dns_resolver: Arc<DnsResolver>,
+        timeout: Duration,
+        upstream_proxy: Option<UpstreamProxyConfig>,
+    ) -> Self {
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -42,6 +49,7 @@ impl DohTlsConnector {
             dns_resolver,
             root_store,
             timeout,
+            upstream_proxy,
             crypto_provider,
             host_ip_cache: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -102,7 +110,7 @@ impl DohTlsConnector {
                 host, port, socket_addr
             );
             match self
-                .try_connect(&connector, socket_addr, server_name.clone())
+                .try_connect(&connector, socket_addr, host, server_name.clone())
                 .await
             {
                 Ok(stream) => {
@@ -299,13 +307,23 @@ impl DohTlsConnector {
         &self,
         connector: &TlsConnector,
         addr: SocketAddr,
+        tunnel_host: &str,
         server_name: ServerName<'static>,
     ) -> Result<TlsStream<TcpStream>> {
         // TCP connect with timeout
-        let tcp_stream = tokio::time::timeout(self.timeout, TcpStream::connect(addr))
+        let tcp_stream = if let Some(proxy) = self.upstream_proxy.as_ref().filter(|proxy| proxy.is_valid()) {
+            tokio::time::timeout(
+                self.timeout,
+                connect_http_tunnel(proxy, tunnel_host, addr.port()),
+            )
             .await
-            .map_err(|_| DohProxyError::Timeout)?
-            .map_err(DohProxyError::Io)?;
+            .map_err(|_| DohProxyError::Timeout)??
+        } else {
+            tokio::time::timeout(self.timeout, TcpStream::connect(addr))
+                .await
+                .map_err(|_| DohProxyError::Timeout)?
+                .map_err(DohProxyError::Io)?
+        };
 
         // TLS handshake with timeout
         let tls_stream = tokio::time::timeout(
@@ -340,7 +358,7 @@ impl DohTlsConnector {
             debug!("Trying to connect to {}:{} via {}", host, port, socket_addr);
             let attempt_start = std::time::Instant::now();
             match self
-                .try_connect(connector, socket_addr, server_name.clone())
+                .try_connect(connector, socket_addr, host, server_name.clone())
                 .await
             {
                 Ok(stream) => {
