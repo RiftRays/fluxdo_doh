@@ -10,10 +10,13 @@ use crate::ech::DohTlsConnector;
 use crate::error::{DohProxyError, Result};
 use crate::ProxyConfig;
 use parking_lot::RwLock;
+use std::io::Cursor;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio_rustls::TlsAcceptor;
@@ -213,10 +216,12 @@ async fn handle_connect_tunnel(
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
 
+    let buffered = reader.buffer().to_vec();
     let read_half = reader.into_inner();
     let client_stream = read_half.reunite(writer).map_err(|_| {
         DohProxyError::Proxy("Failed to reunite TCP stream halves".to_string())
     })?;
+    let client_stream = PrefixedStream::new(client_stream, buffered);
 
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
     let (mut server_read, mut server_write) = tokio::io::split(server_stream);
@@ -275,10 +280,12 @@ async fn handle_connect_mitm(
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
 
+    let buffered = reader.buffer().to_vec();
     let read_half = reader.into_inner();
     let client_stream = read_half.reunite(writer).map_err(|_| {
         DohProxyError::Proxy("Failed to reunite TCP stream halves".to_string())
     })?;
+    let client_stream = PrefixedStream::new(client_stream, buffered);
 
     let server_config = cert_manager.get_server_config(&host)?;
     let acceptor = TlsAcceptor::from(server_config);
@@ -335,5 +342,61 @@ fn parse_host_port(target: &str) -> Result<(String, u16)> {
         Ok((host.to_string(), port))
     } else {
         Ok((target.to_string(), 443))
+    }
+}
+
+struct PrefixedStream<S> {
+    prefix: Cursor<Vec<u8>>,
+    inner: S,
+}
+
+impl<S> PrefixedStream<S> {
+    fn new(inner: S, prefix: Vec<u8>) -> Self {
+        Self {
+            prefix: Cursor::new(prefix),
+            inner,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let position = self.prefix.position() as usize;
+        let prefix = self.prefix.get_ref();
+
+        if position < prefix.len() {
+            let remaining = &prefix[position..];
+            let to_copy = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..to_copy]);
+            self.prefix.set_position((position + to_copy) as u64);
+            return Poll::Ready(Ok(()));
+        }
+
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
