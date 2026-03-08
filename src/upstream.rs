@@ -1,7 +1,15 @@
 use crate::error::{DohProxyError, Result};
-use crate::UpstreamProxyConfig;
+use crate::{BoxStream, UpstreamProxyConfig};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use shadowsocks::{
+    config::{ServerAddr, ServerConfig, ServerType},
+    context::Context,
+    crypto::CipherKind,
+    relay::socks5::Address,
+    ProxyClientStream,
+};
+use std::net::{IpAddr, SocketAddr};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
@@ -10,6 +18,9 @@ impl UpstreamProxyConfig {
     pub fn proxy_url(&self) -> String {
         if self.is_socks5() {
             return format!("socks5h://{}:{}", self.host, self.port);
+        }
+        if self.is_shadowsocks() {
+            return format!("ss://{}:{}", self.host, self.port);
         }
 
         format!("http://{}:{}", self.host, self.port)
@@ -41,17 +52,35 @@ impl UpstreamProxyConfig {
         }
         Some((username, password))
     }
+
+    fn shadowsocks_password(&self) -> Option<&str> {
+        let password = self.password.as_deref()?.trim();
+        if password.is_empty() {
+            return None;
+        }
+        Some(password)
+    }
+
+    fn shadowsocks_cipher(&self) -> Option<&str> {
+        let cipher = self.cipher.as_deref()?.trim();
+        if cipher.is_empty() {
+            return None;
+        }
+        Some(cipher)
+    }
 }
 
 pub async fn connect_tunnel(
     proxy: &UpstreamProxyConfig,
     target_host: &str,
     target_port: u16,
-) -> Result<TcpStream> {
+) -> Result<BoxStream> {
     if proxy.is_http() {
         connect_http_tunnel(proxy, target_host, target_port).await
     } else if proxy.is_socks5() {
         connect_socks5_tunnel(proxy, target_host, target_port).await
+    } else if proxy.is_shadowsocks() {
+        connect_shadowsocks_tunnel(proxy, target_host, target_port).await
     } else {
         Err(DohProxyError::Proxy(format!(
             "Unsupported upstream proxy protocol: {}",
@@ -64,7 +93,7 @@ pub async fn connect_http_tunnel(
     proxy: &UpstreamProxyConfig,
     target_host: &str,
     target_port: u16,
-) -> Result<TcpStream> {
+) -> Result<BoxStream> {
     if !proxy.is_http() {
         return Err(DohProxyError::Proxy(format!(
             "Unsupported upstream HTTP proxy protocol: {}",
@@ -137,7 +166,7 @@ pub async fn connect_http_tunnel(
     match status_code {
         200 => {
             debug!("Upstream HTTP proxy tunnel established for {}", authority);
-            Ok(stream)
+            Ok(Box::new(stream))
         }
         407 => {
             if let Some(header) = proxy_authenticate {
@@ -158,7 +187,7 @@ pub async fn connect_socks5_tunnel(
     proxy: &UpstreamProxyConfig,
     target_host: &str,
     target_port: u16,
-) -> Result<TcpStream> {
+) -> Result<BoxStream> {
     if !proxy.is_socks5() {
         return Err(DohProxyError::Proxy(format!(
             "Unsupported upstream SOCKS5 proxy protocol: {}",
@@ -301,7 +330,54 @@ pub async fn connect_socks5_tunnel(
         "Upstream SOCKS5 tunnel established for {}:{}",
         target_host, target_port
     );
-    Ok(stream)
+    Ok(Box::new(stream))
+}
+
+pub async fn connect_shadowsocks_tunnel(
+    proxy: &UpstreamProxyConfig,
+    target_host: &str,
+    target_port: u16,
+) -> Result<BoxStream> {
+    if !proxy.is_shadowsocks() {
+        return Err(DohProxyError::Proxy(format!(
+            "Unsupported upstream Shadowsocks protocol: {}",
+            proxy.protocol()
+        )));
+    }
+
+    if !proxy.is_valid() {
+        return Err(DohProxyError::Proxy(
+            "Invalid Shadowsocks configuration".to_string(),
+        ));
+    }
+
+    let cipher_name = proxy.shadowsocks_cipher().ok_or_else(|| {
+        DohProxyError::Proxy("Missing Shadowsocks cipher".to_string())
+    })?;
+    let cipher = parse_shadowsocks_cipher(cipher_name)?;
+    let password = proxy.shadowsocks_password().ok_or_else(|| {
+        DohProxyError::Proxy("Missing Shadowsocks password".to_string())
+    })?;
+    let server_addr = build_server_addr(&proxy.host, proxy.port);
+    let server_config = ServerConfig::new(server_addr, password.to_string(), cipher)
+        .map_err(|error| DohProxyError::Proxy(format!("Invalid Shadowsocks config: {}", error)))?;
+    let context = Context::new_shared(ServerType::Local);
+    let target = Address::from((target_host.to_string(), target_port));
+
+    info!(
+        "Connecting to upstream Shadowsocks proxy {} for {}:{} with cipher {}",
+        proxy.proxy_url(),
+        target_host,
+        target_port,
+        cipher_name
+    );
+
+    let stream = ProxyClientStream::connect(context, &server_config, target)
+        .await
+        .map_err(|error| {
+            DohProxyError::Proxy(format!("Upstream Shadowsocks CONNECT failed: {}", error))
+        })?;
+    Ok(Box::new(stream))
 }
 
 fn socks5_reply_message(code: u8) -> &'static str {
@@ -315,5 +391,24 @@ fn socks5_reply_message(code: u8) -> &'static str {
         0x07 => "command not supported",
         0x08 => "address type not supported",
         _ => "unknown error",
+    }
+}
+
+fn build_server_addr(host: &str, port: u16) -> ServerAddr {
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ServerAddr::SocketAddr(SocketAddr::new(ip, port)),
+        Err(_) => ServerAddr::DomainName(host.to_string(), port),
+    }
+}
+
+fn parse_shadowsocks_cipher(cipher: &str) -> Result<CipherKind> {
+    match cipher.trim().to_ascii_lowercase().as_str() {
+        "aes-128-gcm" => Ok(CipherKind::AES_128_GCM),
+        "aes-256-gcm" => Ok(CipherKind::AES_256_GCM),
+        "chacha20-ietf-poly1305" => Ok(CipherKind::CHACHA20_POLY1305),
+        other => Err(DohProxyError::Proxy(format!(
+            "Unsupported Shadowsocks cipher: {}",
+            other
+        ))),
     }
 }

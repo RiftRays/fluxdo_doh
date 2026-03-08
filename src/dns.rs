@@ -566,7 +566,9 @@ impl DnsResolver {
         upstream_proxy: Option<&UpstreamProxyConfig>,
     ) -> Result<Client> {
         let mut builder = Client::builder().timeout(timeout);
-        if let Some(proxy) = upstream_proxy.filter(|proxy| proxy.is_valid()) {
+        if let Some(proxy) = upstream_proxy.filter(|proxy| {
+            proxy.is_valid() && (proxy.is_http() || proxy.is_socks5())
+        }) {
             let mut reqwest_proxy = reqwest::Proxy::all(proxy.reqwest_proxy_url())
                 .map_err(|e| DohProxyError::Proxy(format!("Invalid upstream proxy URL: {}", e)))?;
             if proxy.is_http() {

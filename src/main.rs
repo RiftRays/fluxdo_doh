@@ -54,6 +54,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .position(|a| a == "--upstream-user")
         .and_then(|i| args.get(i + 1))
         .cloned();
+    let upstream_cipher = args
+        .iter()
+        .position(|a| a == "--upstream-cipher")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
     let upstream_password = args
         .iter()
         .position(|a| a == "--upstream-pass")
@@ -67,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             port,
             username: upstream_username,
             password: upstream_password,
+            cipher: upstream_cipher,
         }),
         _ => None,
     };

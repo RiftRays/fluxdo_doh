@@ -4,6 +4,7 @@
 //! resolution and supports ECH to encrypt the SNI field in TLS handshakes.
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub mod cert;
 pub mod dns;
@@ -20,7 +21,7 @@ pub use proxy::DohProxyServer;
 /// Upstream proxy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamProxyConfig {
-    /// Upstream proxy protocol. Supports `http` and `socks5`.
+    /// Upstream proxy protocol. Supports `http`, `socks5` and `shadowsocks`.
     #[serde(default = "default_upstream_protocol")]
     pub protocol: String,
     /// Upstream proxy host
@@ -33,11 +34,32 @@ pub struct UpstreamProxyConfig {
     /// Optional password
     #[serde(default)]
     pub password: Option<String>,
+    /// Optional cipher for Shadowsocks
+    #[serde(default)]
+    pub cipher: Option<String>,
 }
 
 impl UpstreamProxyConfig {
     pub fn is_valid(&self) -> bool {
-        !self.host.trim().is_empty() && self.port > 0
+        if self.host.trim().is_empty() || self.port == 0 {
+            return false;
+        }
+
+        if self.is_shadowsocks() {
+            let cipher = self
+                .cipher
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default();
+            let password = self
+                .password
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default();
+            return !cipher.is_empty() && !password.is_empty();
+        }
+
+        true
     }
 
     pub fn protocol(&self) -> &str {
@@ -57,6 +79,13 @@ impl UpstreamProxyConfig {
         matches!(
             self.protocol().to_ascii_lowercase().as_str(),
             "socks" | "socks5" | "socks5h"
+        )
+    }
+
+    pub fn is_shadowsocks(&self) -> bool {
+        matches!(
+            self.protocol().to_ascii_lowercase().as_str(),
+            "ss" | "shadowsocks"
         )
     }
 }
@@ -103,3 +132,8 @@ fn default_upstream_protocol() -> String {
 fn default_enable_doh() -> bool {
     true
 }
+
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
+pub type BoxStream = Box<dyn AsyncReadWrite>;

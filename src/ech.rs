@@ -6,10 +6,9 @@
 use crate::dns::DnsResolver;
 use crate::error::{DohProxyError, Result};
 use crate::upstream::connect_tunnel;
-use crate::UpstreamProxyConfig;
+use crate::{BoxStream, UpstreamProxyConfig};
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::{client::TlsStream, TlsConnector};
@@ -59,23 +58,24 @@ impl DohTlsConnector {
     }
 
     /// Establish raw TCP tunnel to target host
-    pub async fn connect_tcp(&self, host: &str, port: u16) -> Result<TcpStream> {
+    pub async fn connect_tcp(&self, host: &str, port: u16) -> Result<BoxStream> {
         let stream = if let Some(proxy) = self.upstream_proxy.as_ref().filter(|proxy| proxy.is_valid()) {
             tokio::time::timeout(self.timeout, connect_tunnel(proxy, host, port))
                 .await
                 .map_err(|_| DohProxyError::Timeout)??
         } else {
-            tokio::time::timeout(self.timeout, TcpStream::connect((host, port)))
+            let stream = tokio::time::timeout(self.timeout, TcpStream::connect((host, port)))
                 .await
                 .map_err(|_| DohProxyError::Timeout)?
-                .map_err(DohProxyError::Io)?
+                .map_err(DohProxyError::Io)?;
+            Box::new(stream)
         };
         Ok(stream)
     }
 
     /// Connect to a server using ECH if available
     /// Returns a TLS stream that can be used for bidirectional I/O
-    pub async fn connect(&self, host: &str, port: u16) -> Result<TlsStream<TcpStream>> {
+    pub async fn connect(&self, host: &str, port: u16) -> Result<TlsStream<BoxStream>> {
         let start = std::time::Instant::now();
         let server_name = ServerName::try_from(host.to_string())
             .map_err(|_| DohProxyError::InvalidUrl(format!("Invalid server name: {}", host)))?;
@@ -366,14 +366,20 @@ impl DohTlsConnector {
         addr: SocketAddr,
         tunnel_host: &str,
         server_name: ServerName<'static>,
-    ) -> Result<TlsStream<TcpStream>> {
+    ) -> Result<TlsStream<BoxStream>> {
         // TCP connect with timeout
         let tcp_stream = tokio::time::timeout(self.timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| DohProxyError::Timeout)?
             .map_err(DohProxyError::Io)?;
 
-        self.finish_tls(connector, server_name, tcp_stream, tunnel_host, addr.port())
+        self.finish_tls(
+            connector,
+            server_name,
+            Box::new(tcp_stream),
+            tunnel_host,
+            addr.port(),
+        )
             .await
     }
 
@@ -384,7 +390,7 @@ impl DohTlsConnector {
         host: &str,
         port: u16,
         addrs: Vec<std::net::IpAddr>,
-    ) -> Result<(TlsStream<TcpStream>, SocketAddr, Duration)> {
+    ) -> Result<(TlsStream<BoxStream>, SocketAddr, Duration)> {
         let mut last_error = None;
         for addr in addrs {
             let socket_addr = SocketAddr::new(addr, port);
@@ -445,10 +451,10 @@ impl DohTlsConnector {
         &self,
         connector: &TlsConnector,
         server_name: ServerName<'static>,
-        tcp_stream: TcpStream,
+        tcp_stream: BoxStream,
         host: &str,
         port: u16,
-    ) -> Result<TlsStream<TcpStream>> {
+    ) -> Result<TlsStream<BoxStream>> {
         let tls_stream = tokio::time::timeout(self.timeout, connector.connect(server_name, tcp_stream))
             .await
             .map_err(|_| DohProxyError::Timeout)?
@@ -465,7 +471,3 @@ impl DohTlsConnector {
         Ok(tls_stream)
     }
 }
-
-/// Trait for streams that support bidirectional I/O
-pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
