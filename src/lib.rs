@@ -20,7 +20,7 @@ pub use proxy::DohProxyServer;
 /// Upstream proxy configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpstreamProxyConfig {
-    /// Upstream proxy protocol. V1 only supports `http`.
+    /// Upstream proxy protocol. Supports `http` and `socks5`.
     #[serde(default = "default_upstream_protocol")]
     pub protocol: String,
     /// Upstream proxy host
@@ -48,6 +48,17 @@ impl UpstreamProxyConfig {
             protocol
         }
     }
+
+    pub fn is_http(&self) -> bool {
+        self.protocol().eq_ignore_ascii_case("http")
+    }
+
+    pub fn is_socks5(&self) -> bool {
+        matches!(
+            self.protocol().to_ascii_lowercase().as_str(),
+            "socks" | "socks5" | "socks5h"
+        )
+    }
 }
 
 /// Proxy configuration
@@ -57,6 +68,9 @@ pub struct ProxyConfig {
     pub bind_addr: String,
     /// Local port to bind (default: 0 for auto-select)
     pub bind_port: u16,
+    /// Whether local gateway should use DoH/ECH MITM mode
+    #[serde(default = "default_enable_doh")]
+    pub enable_doh: bool,
     /// DOH server URL for DNS queries
     pub doh_server: String,
     /// Whether to prefer IPv6
@@ -73,6 +87,7 @@ impl Default for ProxyConfig {
         Self {
             bind_addr: "127.0.0.1".to_string(),
             bind_port: 0,
+            enable_doh: true,
             doh_server: "https://cloudflare-dns.com/dns-query".to_string(),
             prefer_ipv6: false,
             timeout_secs: 30,
@@ -83,4 +98,8 @@ impl Default for ProxyConfig {
 
 fn default_upstream_protocol() -> String {
     "http".to_string()
+}
+
+fn default_enable_doh() -> bool {
+    true
 }

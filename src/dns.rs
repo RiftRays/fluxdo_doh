@@ -567,19 +567,15 @@ impl DnsResolver {
     ) -> Result<Client> {
         let mut builder = Client::builder().timeout(timeout);
         if let Some(proxy) = upstream_proxy.filter(|proxy| proxy.is_valid()) {
-            if proxy.protocol() != "http" {
-                return Err(DohProxyError::Proxy(format!(
-                    "Unsupported upstream proxy protocol for DoH: {}",
-                    proxy.protocol()
-                )));
-            }
-            let mut reqwest_proxy = reqwest::Proxy::all(proxy.proxy_url())
+            let mut reqwest_proxy = reqwest::Proxy::all(proxy.reqwest_proxy_url())
                 .map_err(|e| DohProxyError::Proxy(format!("Invalid upstream proxy URL: {}", e)))?;
-            if let (Some(username), Some(password)) = (
+            if proxy.is_http() {
+                if let (Some(username), Some(password)) = (
                 proxy.username.as_deref().filter(|value| !value.trim().is_empty()),
                 proxy.password.as_deref().filter(|value| !value.trim().is_empty()),
-            ) {
-                reqwest_proxy = reqwest_proxy.basic_auth(username, password);
+                ) {
+                    reqwest_proxy = reqwest_proxy.basic_auth(username, password);
+                }
             }
             builder = builder.proxy(reqwest_proxy);
         }
