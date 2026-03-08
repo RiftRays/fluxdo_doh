@@ -3,6 +3,8 @@
 //! This library provides a local HTTP/HTTPS proxy that uses DOH for DNS
 //! resolution and supports ECH to encrypt the SNI field in TLS handshakes.
 
+use base64::engine::general_purpose::{STANDARD, URL_SAFE};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -56,7 +58,22 @@ impl UpstreamProxyConfig {
                 .as_deref()
                 .map(str::trim)
                 .unwrap_or_default();
-            return !cipher.is_empty() && !password.is_empty();
+            if cipher.is_empty() || password.is_empty() {
+                return false;
+            }
+
+            if cipher.eq_ignore_ascii_case("2022-blake3-aes-256-gcm") {
+                let normalized_password = normalize_base64_padding(password);
+                let decoded = STANDARD
+                    .decode(normalized_password.as_bytes())
+                    .or_else(|_| URL_SAFE.decode(normalized_password.as_bytes()));
+                let Ok(decoded) = decoded else {
+                    return false;
+                };
+                return decoded.len() == 32;
+            }
+
+            return true;
         }
 
         true
@@ -131,6 +148,21 @@ fn default_upstream_protocol() -> String {
 
 fn default_enable_doh() -> bool {
     true
+}
+
+fn normalize_base64_padding(input: &str) -> String {
+    let trimmed = input.trim();
+    let remainder = trimmed.len() % 4;
+    if remainder == 0 {
+        return trimmed.to_string();
+    }
+
+    let mut normalized = String::with_capacity(trimmed.len() + (4 - remainder));
+    normalized.push_str(trimmed);
+    for _ in 0..(4 - remainder) {
+        normalized.push('=');
+    }
+    normalized
 }
 
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
